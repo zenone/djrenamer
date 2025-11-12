@@ -1,104 +1,210 @@
-import os
-import sys
+#!/usr/bin/env python3
+"""
+Batch-rename MP3 files using ID3 tags (artist/title).
+
+Features:
+- Thread-safe logging (file or stderr)
+- Safe filename sanitization (no traversal or illegal chars)
+- Deterministic collision handling: "Artist - Title.mp3", "Artist - Title (2).mp3", ...
+- Verbosity levels and progress bar
+- --dry-run and --workers options
+- Type hints and pathlib-first implementation
+
+Examples:
+  python mp3_renamer.py /music
+  python mp3_renamer.py /music -v 2 --dry-run
+  python mp3_renamer.py /music -l rename.log --workers 8
+"""
+
+from __future__ import annotations
+
 import argparse
-import concurrent.futures
-import pathlib
+import logging
+import re
+import sys
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, Tuple
+
 import eyed3
 from tqdm import tqdm
 
 
-def rename_file(file_path, log_file):
-    """Rename a single MP3 file using its ID3 tag information.
+# ----------------------------- Logging -------------------------------- #
 
-    :param file_path: The path of the MP3 file to rename.
-    :param log_file: The log file to write any error messages to.
+def configure_logging(log_path: Optional[Path], verbosity: int) -> logging.Logger:
+    logger = logging.getLogger("mp3_renamer")
+    logger.setLevel(logging.DEBUG)
+
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+    # Console level depends on verbosity
+    console = logging.StreamHandler(sys.stderr)
+    console.setLevel(logging.ERROR if verbosity == 0 else logging.INFO)
+    console.setFormatter(fmt)
+    logger.addHandler(console)
+
+    if log_path:
+        fh = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+
+    return logger
+
+
+# -------------------------- Sanitization ------------------------------ #
+
+_ILLEGAL_CHARS = r'[\\/:"*?<>|]'  # Windows + common POSIX no-nos
+
+def safe_filename(text: str, max_len: int = 120) -> str:
+    """Normalize and sanitize arbitrary text for safe cross-platform filenames."""
+    # Normalize strange unicode
+    t = unicodedata.normalize("NFKC", text or "").strip()
+    # Remove control chars
+    t = re.sub(r"[\x00-\x1f]", "", t)
+    # Replace illegal characters with space
+    t = re.sub(_ILLEGAL_CHARS, " ", t)
+    # Collapse whitespace
+    t = re.sub(r"\s+", " ", t).strip(". ").strip()
+    # Fallback if everything vanished
+    if not t:
+        t = "untitled"
+    # Trim length conservatively (leave room for suffix)
+    return t[:max_len]
+
+
+def build_base_name(artist: Optional[str], title: Optional[str]) -> str:
+    a = safe_filename(artist or "Unknown Artist")
+    t = safe_filename(title or "Unknown Title")
+    return f"{a} - {t}"
+
+
+def unique_path(directory: Path, stem: str, ext: str = ".mp3") -> Path:
     """
+    Return a unique path in directory for stem+ext by appending (n).
+    """
+    candidate = directory / f"{stem}{ext}"
+    if not candidate.exists():
+        return candidate
+    n = 2
+    while True:
+        candidate = directory / f"{stem} ({n}){ext}"
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+# --------------------------- Renaming --------------------------------- #
+
+@dataclass(frozen=True)
+class RenameResult:
+    src: Path
+    dst: Optional[Path]
+    status: str  # "renamed" | "skipped" | "error"
+    message: Optional[str] = None
+
+
+def derive_target(src: Path, logger: logging.Logger) -> Tuple[Optional[Path], Optional[str]]:
+    """Compute the desired destination path for a file, or return a reason to skip."""
     try:
-        # Load the MP3 file using the eyeD3 library.
-        audiofile = eyed3.load(file_path)
+        audio = eyed3.load(src.as_posix())
+        if not audio or not audio.tag:
+            return None, "No ID3 tag found"
+        artist = getattr(audio.tag, "artist", None)
+        title = getattr(audio.tag, "title", None)
 
-        # Get the artist and title information from the MP3 file's ID3 tag.
-        artist = audiofile.tag.artist
-        title = audiofile.tag.title
+        if not artist and not title:
+            return None, "Missing artist and title tags"
 
-        # Generate the new file name based on the artist and title information.
-        new_file_name = "{} - {}.mp3".format(artist, title)
+        stem = build_base_name(artist, title)
+        dst = unique_path(src.parent, stem, ".mp3")
+        if dst == src:
+            return None, "Already has desired name"
 
-        # Generate the new file path based on the new file name and the original file's directory.
-        new_file_path = os.path.join(os.path.dirname(file_path), new_file_name)
-
-        # If a file already exists with the new file name, add a suffix to the new file name to ensure uniqueness.
-        if os.path.exists(new_file_path):
-            new_file_name = "{} - {}_{}.mp3".format(artist, title, os.path.splitext(file_path)[0][-3:])
-            new_file_path = os.path.join(os.path.dirname(file_path), new_file_name)
-
-        # If the new file path is the same as the original file path, skip renaming the file.
-        if new_file_path == file_path:
-            log_file.write(f"Skipping file: {file_path} - already renamed\n")
-            return
-
-        # Rename the MP3 file.
-        os.rename(file_path, new_file_path)
-    except Exception as e:
-        # Write any errors to the log file.
-        log_file.write(f"Error processing file: {file_path} - {e}\n")
+        return dst, None
+    except Exception as exc:
+        logger.debug("Tag parse error for %s", src, exc_info=True)
+        return None, f"Exception reading tags: {exc}"
 
 
-def rename_files(root_dir, log_file, verbosity):
-    """
-    Batch rename MP3 files using ID3 tags
+def rename_one(src: Path, dry_run: bool, logger: logging.Logger) -> RenameResult:
+    dst, skip_reason = derive_target(src, logger)
+    if skip_reason:
+        return RenameResult(src=src, dst=None, status="skipped", message=skip_reason)
+    try:
+        if dry_run:
+            return RenameResult(src=src, dst=dst, status="renamed", message="dry-run")
+        # Atomic on same filesystem
+        src.rename(dst)  # raises if permission/locked
+        return RenameResult(src=src, dst=dst, status="renamed")
+    except Exception as exc:
+        logger.error("Rename failed %s -> %s: %s", src, dst, exc, exc_info=True)
+        return RenameResult(src=src, dst=dst, status="error", message=str(exc))
 
-    :param root_dir: Root directory containing MP3 files to rename
-    :param log_file: File to store the log of the renaming process
-    :param verbosity: Control the amount of output displayed. 0: only errors; 1: progress bar; 2: progress bar and verbose output
-    """
 
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        # Convert root_dir to a Path object
-        root_dir = pathlib.Path(root_dir)
+# ------------------------------ CLI ----------------------------------- #
 
-        # Get a list of all MP3 files in the root_dir and its subdirectories
-        mp3_files = [entry.as_posix() for entry in root_dir.rglob("*.mp3")]
+def find_mp3s(root_dir: Path) -> list[Path]:
+    return list(root_dir.rglob("*.mp3"))
 
-        if verbosity > 0:
-            print(f"Renaming {len(mp3_files)} MP3 files in {root_dir} and its subdirectories")
 
-        # Use tqdm to show a progress bar
-        with tqdm(total=len(mp3_files)) as pbar:
-            # Use concurrent.futures to run the rename_file function in parallel
-            for future in concurrent.futures.as_completed(executor.submit(rename_file, file, log_file) for file in mp3_files):
-                # Increment the progress bar
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Batch rename MP3 files using ID3 tags (artist/title).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("root_dir", help="Root directory containing MP3 files to rename")
+    parser.add_argument("-l", "--log-file", type=Path, help="Write detailed logs to this file")
+    parser.add_argument("-v", "--verbosity", type=int, choices=[0, 1, 2], default=1,
+                        help="0: errors only, 1: progress, 2: verbose progress")
+    parser.add_argument("--dry-run", action="store_true", help="Show intended renames without changing files")
+    parser.add_argument("--workers", type=int, default=8, help="Number of worker threads (I/O bound)")
+    args = parser.parse_args()
+
+    root = Path(args.root_dir)
+    if not root.is_dir():
+        print(f"Error: Invalid directory path: {root}", file=sys.stderr)
+        return 1
+
+    logger = configure_logging(args.log_file, args.verbosity)
+
+    mp3s = find_mp3s(root)
+    if args.verbosity >= 1:
+        print(f"Scanning {root} — found {len(mp3s)} MP3 file(s)")
+
+    renamed = skipped = errors = 0
+
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        futures = [ex.submit(rename_one, p, args.dry_run, logger) for p in mp3s]
+        with tqdm(total=len(futures), disable=(args.verbosity == 0)) as pbar:
+            for fut in as_completed(futures):
+                res: RenameResult = fut.result()
+                if res.status == "renamed":
+                    renamed += 1
+                    if args.verbosity == 2:
+                        if res.message == "dry-run":
+                            logger.info("[DRY] %s -> %s", res.src.name, res.dst.name if res.dst else "(same)")
+                        else:
+                            logger.info("Renamed: %s -> %s", res.src.name, res.dst.name if res.dst else "(same)")
+                elif res.status == "skipped":
+                    skipped += 1
+                    if args.verbosity == 2:
+                        logger.info("Skipped: %s (%s)", res.src.name, res.message or "reason unknown")
+                else:
+                    errors += 1
+                    # Error already logged at error level in rename_one
                 pbar.update(1)
 
-                if verbosity > 1:
-                    # Get the result of the rename_file function
-                    result = future.result()
+    if args.verbosity >= 1:
+        print(f"Done. Renamed: {renamed} | Skipped: {skipped} | Errors: {errors}")
+        if args.dry_run:
+            print("(Dry run - no files changed)")
+
+    return 0
 
 
 if __name__ == "__main__":
-    # Initialize the argument parser
-    parser = argparse.ArgumentParser(description="Batch rename MP3 files using ID3 tags")
-    parser.add_argument("root_dir", help="Root directory containing MP3 files to rename")
-    parser.add_argument("-l", "--log-file", help="File to store the log of the renaming process")
-    parser.add_argument("-v", "--verbosity", type=int, choices=[0, 1, 2], default=0, help="Control the amount of output displayed. 0: only errors; 1: progress bar; 2: progress bar and verbose output")
-
-    # Parse the command-line arguments
-    args = parser.parse_args()
-
-    # Check if the root directory is a valid directory
-    root_dir = pathlib.Path(args.root_dir)
-    if not root_dir.is_dir():
-        print(f"Error: Invalid directory path: {root_dir}")
-        sys.exit(1)
-
-    # Open the log file if specified
-    log_file = None
-    if args.log_file:
-        log_file = open(args.log_file, "w")
-
-    # Call the rename_files function with the root directory, log file, and verbosity level
-    rename_files(root_dir, log_file, args.verbosity)
-
-    # Close the log file if it was opened
-    if log_file:
-        log_file.close()
+    sys.exit(main())
